@@ -20,7 +20,7 @@ jobs:
         with:
           # Single source of truth: reads the version from go.mod.
           go-version-file: go.mod
-          
+
   security-scan:
     runs-on: ubuntu-latest
     permissions:
@@ -57,6 +57,7 @@ jobs:
           command: monitor
 
   docker-build:
+    needs: [test, security-scan]
     runs-on: ubuntu-latest
     permissions:
       contents: read
