@@ -21,7 +21,36 @@ jobs:
           # Single source of truth: reads the version from go.mod.
           go-version-file: go.mod
 
+  security-scan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Scan with Snyk
+        uses: snyk/actions/golang@v1.0.0
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          command: code test
+      
+      - name: Push Snapshot to Snyk Dashboard
+        uses: snyk/actions/golang@v1.0.0
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          command: monitor
+
   docker-build:
+    needs: [test, security-scan]
     runs-on: ubuntu-latest
     permissions:
       contents: read
