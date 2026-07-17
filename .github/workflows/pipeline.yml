@@ -20,11 +20,12 @@ jobs:
         with:
           # Single source of truth: reads the version from go.mod.
           go-version-file: go.mod
-    docker-build:
-      runs-on: ubuntu-latest
-      permissions:
-        contents: read
-      steps:
+
+  docker-build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
       - name: Check out code
         uses: actions/checkout@v7
 
@@ -36,4 +37,3 @@ jobs:
         with:
           context: .
           push: false
-          tags: go-actions-starter:ci
