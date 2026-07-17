@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Guess the Country</title>
+<style>
+  body { font-family: system-ui, sans-serif; background: #1e2530; color: #eee;
+         display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; }
+  .card { background: #2a3242; border-radius: 12px; padding: 2rem 2.5rem; width: 22rem; text-align: center; }
+  .score { color: #9aa5b8; font-size: 0.9rem; margin-bottom: 1rem; }
+  .verdict { font-size: 1.5rem; margin: 0 0 0.5rem; }
+  .correct { color: #6fd58c; }
+  .wrong { color: #e97070; }
+  .detail { color: #9aa5b8; margin: 0 0 1.5rem; }
+  a.next { display: inline-block; margin-top: 0.5rem; padding: 0.75rem 1.5rem; border-radius: 8px;
+         background: #4a6cf7; color: #fff; text-decoration: none; font-size: 1rem; }
+  a.next:hover { background: #3a5ce0; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <div class="score">Score: {{.Score}} / {{.Total}}</div>
+    {{if .Correct}}
+      <p class="verdict correct">Correct!</p>
+      <p class="detail">{{.Choice}} was right.</p>
+    {{else}}
+      <p class="verdict wrong">Wrong</p>
+      <p class="detail">You picked {{.Choice}}. The correct answer was {{.Answer}}.</p>
+    {{end}}
+    <a class="next" href="/?score={{.Score}}&total={{.Total}}">Next question</a>
+  </div>
+</body>
+</html>
