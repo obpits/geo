@@ -72,7 +72,7 @@ func main() {
 
 	s := &server{capitals: capitals, images: NewImageCache()}
 
-	mux := http.NewServeMux()
+	mux := newRouter()
 	mux.HandleFunc("GET /{$}", s.handleQuestion)
 	mux.HandleFunc("POST /answer", s.handleAnswer)
 

@@ -21,6 +21,9 @@ jobs:
           # Single source of truth: reads the version from go.mod.
           go-version-file: go.mod
 
+      - name: Run tests
+        run: go test ./...
+
   security-scan:
     runs-on: ubuntu-latest
     permissions:
@@ -81,10 +84,14 @@ jobs:
           images: ${{ steps.image.outputs.name }}
           tags: |
             type=sha,prefix=,format=short
+
+      - name: Set version
+        id: version
+        run: echo "sha=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
                     
       - name: Authenticate to Google Cloud
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        uses: google-github-actions/auth@v2
+        uses: google-github-actions/auth@v3
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
 
@@ -99,3 +106,32 @@ jobs:
           push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ steps.version.outputs.sha }}
+
+  deploy:
+    needs: docker-build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: prod
+    permissions:
+      contents: read
+    env:
+      GAR_PROJECT: ${{ vars.GAR_PROJECT }}
+      RUN_REGION: ${{ vars.RUN_REGION }}
+      RUN_SERVICE: ${{ vars.RUN_SERVICE }}
+    steps:
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v3
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Deploy to Cloud Run
+        uses: google-github-actions/deploy-cloudrun@v3
+        with:
+          service: ${{ env.RUN_SERVICE }}
+          region: ${{ env.RUN_REGION }}
+          project_id: ${{ env.GAR_PROJECT }}
+          # Same short-SHA tag that docker-build just pushed, so Cloud Run
+          # runs exactly the image that was built and versioned in this run.
+          image: ${{ needs.docker-build.outputs.image }}:${{ needs.docker-build.outputs.sha }}

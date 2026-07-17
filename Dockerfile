@@ -4,7 +4,7 @@ COPY go.mod ./
 RUN go mod download
 COPY . .
 ARG VERSION=dev
-RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/app .
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" -o /out/app .
 
 FROM gcr.io/distroless/static-debian12:nonroot
 COPY --from=build /out/app /app
