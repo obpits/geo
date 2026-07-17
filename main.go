@@ -9,6 +9,7 @@ import (
 
 type server struct {
 	capitals []Capital
+	images   *ImageCache
 }
 
 func (s *server) handleQuestion(w http.ResponseWriter, r *http.Request) {
@@ -16,14 +17,16 @@ func (s *server) handleQuestion(w http.ResponseWriter, r *http.Request) {
 	total, _ := strconv.Atoi(r.URL.Query().Get("total"))
 
 	q := NewQuestion(s.capitals)
+	imageURL := s.images.Get(q.City)
 
 	data := struct {
-		City    string
-		Options []string
-		Answer  string
-		Score   int
-		Total   int
-	}{q.City, q.Options, q.Answer, score, total}
+		City     string
+		ImageURL string
+		Options  []string
+		Answer   string
+		Score    int
+		Total    int
+	}{q.City, imageURL, q.Options, q.Answer, score, total}
 
 	if err := templates.ExecuteTemplate(w, "question.html.tmpl", data); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -67,7 +70,7 @@ func main() {
 	}
 	log.Printf("loaded %d capitals", len(capitals))
 
-	s := &server{capitals: capitals}
+	s := &server{capitals: capitals, images: NewImageCache()}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /{$}", s.handleQuestion)
