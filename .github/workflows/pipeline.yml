@@ -120,6 +120,8 @@ jobs:
       GAR_PROJECT: ${{ vars.GAR_PROJECT }}
       RUN_REGION: ${{ vars.RUN_REGION }}
       RUN_SERVICE: ${{ vars.RUN_SERVICE }}
+    outputs:
+      url: ${{ steps.deploy.outputs.url }}
     steps:
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v3
@@ -127,6 +129,7 @@ jobs:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
 
       - name: Deploy to Cloud Run
+        id: deploy
         uses: google-github-actions/deploy-cloudrun@v3
         with:
           service: ${{ env.RUN_SERVICE }}
@@ -135,3 +138,28 @@ jobs:
           # Same short-SHA tag that docker-build just pushed, so Cloud Run
           # runs exactly the image that was built and versioned in this run.
           image: ${{ needs.docker-build.outputs.image }}:${{ needs.docker-build.outputs.sha }}
+
+  verify-deployment:
+    needs: [docker-build, deploy]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Verify deployed version matches build
+        env:
+          EXPECTED_VERSION: ${{ needs.docker-build.outputs.sha }}
+          SERVICE_URL: ${{ needs.deploy.outputs.url }}
+        run: |
+          set -euo pipefail
+
+          actual_version="$(curl -sf --retry 5 --retry-delay 3 --retry-connrefused \
+            "${SERVICE_URL}/version" | jq -r .version)"
+
+          echo "expected: ${EXPECTED_VERSION}"
+          echo "actual:   ${actual_version}"
+
+          if [ "${actual_version}" != "${EXPECTED_VERSION}" ]; then
+            echo "::error::Deployed version (${actual_version}) does not match built version (${EXPECTED_VERSION})"
+            exit 1
+          fi
