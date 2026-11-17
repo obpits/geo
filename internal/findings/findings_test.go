@@ -1,6 +1,8 @@
 package findings
 
 import (
+	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -9,15 +11,27 @@ import (
 	"unicode/utf8"
 )
 
+// readFixture loads captured scanner output from testdata/. The fixtures hold
+// real vulnerability data and are gitignored, so they exist only on machines
+// where someone downloaded them from a snyk-findings artifact; elsewhere
+// (including CI) the test is skipped rather than failed.
+func readFixture(t *testing.T, name string) []byte {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join("testdata", name))
+	if errors.Is(err, fs.ErrNotExist) {
+		t.Skipf("testdata/%s not present (gitignored); download it from a snyk-findings artifact to run this test", name)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
 // TestParseSnykTestFixture runs against real output captured from the
 // security-scan job (testdata/snyk-test.json): 16 path entries covering two
 // vulnerabilities in go.opentelemetry.io, pulled in by anthropic-sdk-go.
 func TestParseSnykTestFixture(t *testing.T) {
-	b, err := os.ReadFile(filepath.Join("testdata", SCAFile))
-	if err != nil {
-		t.Fatal(err)
-	}
-	fs, err := ParseSnykTest(b)
+	fs, err := ParseSnykTest(readFixture(t, SCAFile))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -109,10 +123,12 @@ func writeDir(t *testing.T, files map[string][]byte) string {
 }
 
 func TestLoadDir(t *testing.T) {
-	sca, err := os.ReadFile(filepath.Join("testdata", SCAFile))
-	if err != nil {
-		t.Fatal(err)
-	}
+	// Minimal stand-in so these tests run without the gitignored fixture; the
+	// parser itself is exercised against the real capture above.
+	sca := []byte(`{"vulnerabilities": [
+		{"id": "SNYK-A", "packageName": "example.com/a", "version": "1.0.0", "from": ["root@0.0.0", "example.com/a@1.0.0"]},
+		{"id": "SNYK-B", "packageName": "example.com/b", "version": "2.0.0", "from": ["root@0.0.0", "example.com/b@2.0.0"]}
+	]}`)
 	status := func(sca, sast string) []byte {
 		return []byte(`{"sca":"` + sca + `","sast":"` + sast + `"}`)
 	}
