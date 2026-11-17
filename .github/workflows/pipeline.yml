@@ -66,12 +66,26 @@ jobs:
           command: test
           args: --json-file-output=snyk-test.json
 
+      # snyk code test writes no --json-file-output file when it finds nothing,
+      # so the agent cannot tell a clean scan from one that never ran by the
+      # file alone. Record each step's outcome; the agent accepts a missing
+      # findings file only when its step outcome is "success".
+      - name: Record scan outcomes
+        if: always()
+        env:
+          SCA: ${{ steps.sca.outcome }}
+          SAST: ${{ steps.sast.outcome }}
+        run: |
+          jq -n --arg sca "$SCA" --arg sast "$SAST" '{sca: $sca, sast: $sast}' > scan-status.json
+          cat scan-status.json
+
       - name: Upload findings
         if: always()
         uses: actions/upload-artifact@v7
         with:
           name: snyk-findings
           path: |
+            scan-status.json
             snyk-code.json
             snyk-test.json
           if-no-files-found: warn
@@ -127,7 +141,7 @@ jobs:
           go-version-file: go.mod
 
       - name: Download findings
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v8
         with:
           name: snyk-findings
           path: findings
@@ -167,7 +181,7 @@ jobs:
       pull-requests: write
     steps:
       - name: Download triage
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v8
         with:
           name: agent-triage
           path: agent-out
