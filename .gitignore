@@ -1,3 +1,8 @@
 *.exe
-internal/
 AGENT_DESIGN.md
+
+# Scan findings and agent output. Never commit these.
+/snyk-*.json
+/findings/
+/agent-out/
+*.sarif
