@@ -29,22 +29,68 @@ jobs:
     permissions:
       contents: read
       security-events: write
+    # The scans no longer fail this job (continue-on-error), so the agent job can
+    # run on exactly the PRs that have findings. Their outcomes are exported here
+    # and enforced by security-gate, which docker-build depends on.
+    outputs:
+      sast_outcome: ${{ steps.sast.outcome }}
+      sca_outcome: ${{ steps.sca.outcome }}
     steps:
       - name: Check out code
         uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Set up Go
         uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
 
-      - name: Scan with Snyk
+      - name: SAST scan with Snyk (snyk code test)
+        id: sast
+        continue-on-error: true
         uses: snyk/actions/golang@v1.0.0
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
         with:
           command: code test
-      
+          args: --json-file-output=snyk-code.json
+
+      - name: SCA scan with Snyk (snyk test)
+        id: sca
+        continue-on-error: true
+        uses: snyk/actions/golang@v1.0.0
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          command: test
+          args: --json-file-output=snyk-test.json
+
+      # snyk code test writes no --json-file-output file when it finds nothing,
+      # so the agent cannot tell a clean scan from one that never ran by the
+      # file alone. Record each step's outcome; the agent accepts a missing
+      # findings file only when its step outcome is "success".
+      - name: Record scan outcomes
+        if: always()
+        env:
+          SCA: ${{ steps.sca.outcome }}
+          SAST: ${{ steps.sast.outcome }}
+        run: |
+          jq -n --arg sca "$SCA" --arg sast "$SAST" '{sca: $sca, sast: $sast}' > scan-status.json
+          cat scan-status.json
+
+      - name: Upload findings
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: snyk-findings
+          path: |
+            scan-status.json
+            snyk-code.json
+            snyk-test.json
+          if-no-files-found: warn
+          retention-days: 14
+
       - name: Push Snapshot to Snyk Dashboard
         uses: snyk/actions/golang@v1.0.0
         env:
@@ -52,8 +98,127 @@ jobs:
         with:
           command: monitor
 
+  # The pass/fail decision the scans used to make inline. Fails closed: a scan
+  # that errored (exit 2/3) is treated the same as one that found something.
+  security-gate:
+    needs: security-scan
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Enforce scan results
+        env:
+          SAST: ${{ needs.security-scan.outputs.sast_outcome }}
+          SCA: ${{ needs.security-scan.outputs.sca_outcome }}
+        run: |
+          echo "snyk code test: ${SAST}"
+          echo "snyk test:      ${SCA}"
+          if [ "${SAST}" != "success" ] || [ "${SCA}" != "success" ]; then
+            echo "::error::Snyk reported findings or failed to run. See the security-scan job and the snyk-findings artifact."
+            exit 1
+          fi
+
+  # Reads the findings artifact, makes one model call, writes result.json,
+  # comment.md and trace.jsonl to disk. Read-only token, and no GitHub
+  # credential reaches the binary: checkout does not persist one, and no step
+  # here passes GITHUB_TOKEN into the environment. Never add write permissions
+  # to this job.
+  agent-remediate:
+    needs: security-scan
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Download findings
+        uses: actions/download-artifact@v8
+        with:
+          name: snyk-findings
+          path: findings
+
+      - name: Build agent
+        run: go build -o "${RUNNER_TEMP}/remediate" ./cmd/remediate
+
+      - name: Triage findings
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          "${RUNNER_TEMP}/remediate" \
+            -findings findings \
+            -out agent-out \
+            -timeout 3m \
+            -max-tokens 16000 \
+            -run-url "${RUN_URL}"
+
+      - name: Upload triage and trace
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: agent-triage
+          path: agent-out/
+          if-no-files-found: warn
+          retention-days: 30
+
+  # Publishes the agent's output. Contains no model call and no repository
+  # checkout; the only write permission in the agent path lives here.
+  agent-comment:
+    needs: agent-remediate
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Download triage
+        uses: actions/download-artifact@v8
+        with:
+          name: agent-triage
+          path: agent-out
+
+      - name: Validate and post comment
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          status="$(jq -r .status agent-out/result.json)"
+          if [ "${status}" != "triaged" ]; then
+            echo "Agent status is '${status}'; nothing to post."
+            exit 0
+          fi
+
+          marker='<!-- geo-remediation-agent -->'
+          body=agent-out/comment.md
+          [ -f "${body}" ] || { echo "::error::comment.md missing"; exit 1; }
+          [ "$(head -n1 "${body}")" = "${marker}" ] || { echo "::error::comment.md lacks marker"; exit 1; }
+          size="$(wc -c < "${body}")"
+          [ "${size}" -le 60000 ] || { echo "::error::comment.md is ${size} bytes"; exit 1; }
+
+          # Update this agent's previous comment instead of adding a new one per push.
+          existing="$(gh api "repos/${REPO}/issues/${PR}/comments" --paginate \
+            --jq ".[] | select(.user.login == \"github-actions[bot]\" and (.body | startswith(\"${marker}\"))) | .id" \
+            | tail -n1)"
+          if [ -n "${existing}" ]; then
+            gh api -X PATCH "repos/${REPO}/issues/comments/${existing}" -F "body=@${body}" > /dev/null
+            echo "Updated comment ${existing}"
+          else
+            gh pr comment "${PR}" --repo "${REPO}" --body-file "${body}"
+          fi
+
   docker-build:
-    needs: [test, security-scan]
+    needs: [test, security-gate]
     runs-on: ubuntu-latest
     permissions:
       contents: read
