@@ -117,28 +117,38 @@ jobs:
             exit 1
           fi
 
-  # Reads the findings artifact, makes one model call, writes result.json,
-  # comment.md and trace.jsonl to disk. Read-only token, and no GitHub
-  # credential reaches the binary: checkout does not persist one, and no step
-  # here passes GITHUB_TOKEN into the environment. Never add write permissions
-  # to this job.
+  # Reads the findings artifact and works in a scratch worktree of the PR head:
+  # upgrades dependencies, verifies (build, test, fixed-version check, Snyk
+  # re-scan, at most three times), and writes result.json, comment.md,
+  # trace.jsonl and, for a verified fix, patch.diff and pr.md to disk.
+  # Read-only token, and no GitHub credential reaches the binary: checkout does
+  # not persist one, and no step here passes GITHUB_TOKEN into the environment.
+  # The binary hands its tool subprocesses an allowlisted environment, so
+  # go test never sees the API key or the Snyk token. Never add write
+  # permissions to this job.
   agent-remediate:
     needs: security-scan
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     permissions:
       contents: read
     steps:
-      - name: Check out code
+      # The PR head, not the default merge commit, so patch.diff applies to the
+      # branch the agent's pull request will target.
+      - name: Check out PR head
         uses: actions/checkout@v7
         with:
+          ref: ${{ github.event.pull_request.head.sha }}
           persist-credentials: false
 
       - name: Set up Go
         uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
+
+      - name: Set up Snyk CLI
+        uses: snyk/actions/setup@v1.0.0
 
       - name: Download findings
         uses: actions/download-artifact@v8
@@ -149,16 +159,21 @@ jobs:
       - name: Build agent
         run: go build -o "${RUNNER_TEMP}/remediate" ./cmd/remediate
 
-      - name: Triage findings
+      - name: Remediate findings
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           "${RUNNER_TEMP}/remediate" \
             -findings findings \
             -out agent-out \
-            -timeout 3m \
+            -repo . \
+            -snyk snyk \
+            -timeout 15m \
             -max-tokens 16000 \
+            -token-budget 400000 \
+            -max-turns 20 \
             -run-url "${RUN_URL}"
 
       - name: Upload triage and trace
@@ -170,41 +185,120 @@ jobs:
           if-no-files-found: warn
           retention-days: 30
 
-  # Publishes the agent's output. Contains no model call and no repository
-  # checkout; the only write permission in the agent path lives here.
-  agent-comment:
+  # Publishes the agent's output. Contains no model call, and runs nothing from
+  # the repository: it applies a validated diff with git and calls the GitHub
+  # API. The only write permissions in the agent path live here.
+  #
+  # The branch name is built from the PR number and head SHA, and the base is
+  # the PR's own head branch, never main; neither comes from the model. Fork
+  # PRs get the comment only, since this token cannot push to a fork.
+  agent-publish:
     needs: agent-remediate
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
+      contents: write
       pull-requests: write
     steps:
-      - name: Download triage
+      - name: Download agent output
         uses: actions/download-artifact@v8
         with:
           name: agent-triage
           path: agent-out
 
-      - name: Validate and post comment
+      - name: Read status
+        id: agent
+        run: |
+          status="$(jq -r .status agent-out/result.json)"
+          echo "Agent status: ${status}"
+          echo "status=${status}" >> "$GITHUB_OUTPUT"
+
+      - name: Check out PR head
+        if: steps.agent.outputs.status == 'patched' && github.event.pull_request.head.repo.full_name == github.repository
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: repo
+
+      - name: Validate patch and open pull request
+        id: pr
+        if: steps.agent.outputs.status == 'patched' && github.event.pull_request.head.repo.full_name == github.repository
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           PR: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          # Branch names are user-controlled text: only ever used via env, never
+          # interpolated into the script.
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
         run: |
           set -euo pipefail
-          status="$(jq -r .status agent-out/result.json)"
-          if [ "${status}" != "triaged" ]; then
-            echo "Agent status is '${status}'; nothing to post."
-            exit 0
-          fi
+          out="${GITHUB_WORKSPACE}/agent-out"
+          patch="${out}/patch.diff"
+          body="${out}/pr.md"
+          marker='<!-- geo-remediation-agent -->'
+          [ -s "${patch}" ] || { echo "::error::patch.diff missing or empty"; exit 1; }
+          [ -f "${body}" ] || { echo "::error::pr.md missing"; exit 1; }
+          [ "$(head -n1 "${body}")" = "${marker}" ] || { echo "::error::pr.md lacks marker"; exit 1; }
+          [ "$(wc -c < "${body}")" -le 60000 ] || { echo "::error::pr.md too large"; exit 1; }
 
+          cd repo
+          # Independent of the agent's own check: the patch may touch go.mod
+          # and go.sum only. numstat's third column is the path; renames show
+          # as "a => b" and fail the match.
+          paths="$(git apply --numstat "${patch}" | cut -f3)"
+          [ -n "${paths}" ] || { echo "::error::patch touches no files"; exit 1; }
+          bad="$(printf '%s\n' "${paths}" | grep -vxE 'go\.mod|go\.sum' || true)"
+          [ -z "${bad}" ] || { echo "::error::patch touches disallowed paths: ${bad}"; exit 1; }
+          git apply --check "${patch}"
+          git apply "${patch}"
+
+          branch="agent/remediate-pr${PR}-${HEAD_SHA:0:7}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -q -b "${branch}"
+          git add go.mod go.sum
+          git commit -q -m "Upgrade dependencies to fix security findings in #${PR}"
+          # Same branch name for a re-run on the same commit; it is the agent's
+          # own branch, so overwriting it is safe.
+          git push --force origin "HEAD:refs/heads/${branch}"
+
+          url="$(gh pr list --repo "${REPO}" --head "${branch}" --state open --json url --jq '.[0].url // empty')"
+          if [ -n "${url}" ]; then
+            gh pr edit "${url}" --body-file "${body}" > /dev/null
+            echo "Updated ${url}"
+          else
+            url="$(gh pr create --repo "${REPO}" --base "${HEAD_REF}" --head "${branch}" \
+              --title "Security: dependency upgrade for #${PR}" --body-file "${body}")"
+            echo "Opened ${url}"
+          fi
+          echo "url=${url}" >> "$GITHUB_OUTPUT"
+
+      - name: Validate and post comment
+        if: contains(fromJSON('["patched","unfixable","triaged"]'), steps.agent.outputs.status)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          STATUS: ${{ steps.agent.outputs.status }}
+          PR_URL: ${{ steps.pr.outputs.url }}
+        run: |
+          set -euo pipefail
           marker='<!-- geo-remediation-agent -->'
           body=agent-out/comment.md
           [ -f "${body}" ] || { echo "::error::comment.md missing"; exit 1; }
           [ "$(head -n1 "${body}")" = "${marker}" ] || { echo "::error::comment.md lacks marker"; exit 1; }
           size="$(wc -c < "${body}")"
           [ "${size}" -le 60000 ] || { echo "::error::comment.md is ${size} bytes"; exit 1; }
+
+          if [ "${STATUS}" = "patched" ]; then
+            if [ -n "${PR_URL}" ]; then
+              printf '\n**Pull request:** %s\n' "${PR_URL}" >> "${body}"
+            else
+              printf '\n**Pull request not opened:** this workflow cannot push to a fork. The verified patch is in the agent-triage artifact.\n' >> "${body}"
+            fi
+          fi
 
           # Update this agent's previous comment instead of adding a new one per push.
           existing="$(gh api "repos/${REPO}/issues/${PR}/comments" --paginate \
