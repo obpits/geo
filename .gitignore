@@ -1,1 +1,3 @@
 *.exe
+internal/
+AGENT_DESIGN.md
