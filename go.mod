@@ -2,7 +2,7 @@ module citycountrygame
 
 go 1.26.11
 
-require github.com/anthropics/anthropic-sdk-go/v2 v2.10.0
+require github.com/anthropics/anthropic-sdk-go/v2 v2.14.0
 
 require (
 	github.com/bahlo/generic-list-go v0.2.0 // indirect
